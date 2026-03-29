@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAW Triage</title>
+<style>
+  :root {
+    --bg: #1a1a1a; --bg2: #252525; --bg3: #333;
+    --fg: #e0e0e0; --fg2: #999;
+    --red: #e54545; --yellow: #e5b845; --green: #45b85a;
+    --blue: #4a9eed; --radius: 6px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; user-select: none; }
+
+  /* Top bar */
+  .topbar { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; background: var(--bg2); border-bottom: 1px solid var(--bg3); flex-shrink: 0; min-height: 44px; }
+  .topbar-left { display: flex; align-items: center; gap: 12px; }
+  .topbar-right { display: flex; align-items: center; gap: 8px; }
+  .nav-btn { background: none; border: 1px solid var(--bg3); color: var(--fg2); padding: 4px 12px; border-radius: var(--radius); cursor: pointer; font-size: 14px; }
+  .nav-btn:hover { background: var(--bg3); color: var(--fg); }
+  .counter { font-size: 14px; color: var(--fg2); min-width: 80px; text-align: center; }
+  .filename { font-size: 14px; font-weight: 600; color: var(--fg); }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; margin-left: 8px; text-transform: uppercase; }
+  .badge-delete { background: var(--red); color: #fff; }
+  .badge-keep_jpeg { background: var(--yellow); color: #000; }
+  .badge-keep_both { background: var(--green); color: #fff; }
+  .badge-raw { background: rgba(229,69,69,0.2); color: var(--red); font-weight: 500; }
+  .badge-lossy { background: rgba(74,158,237,0.2); color: var(--blue); font-weight: 500; }
+  .badge-pair { background: rgba(69,184,90,0.2); color: var(--green); font-weight: 500; }
+
+  /* Main area */
+  .main { flex: 1; display: flex; position: relative; overflow: hidden; min-height: 0; }
+  .viewer { flex: 1; display: flex; align-items: center; justify-content: center; padding: 12px; position: relative; min-width: 0; overflow: hidden; cursor: zoom-in; }
+  .viewer img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; transition: opacity 0.15s; }
+  .viewer img.loading { opacity: 0.3; }
+  .viewer.zoomed { cursor: zoom-out; }
+  .viewer.zoomed.dragging { cursor: grabbing; }
+  .viewer.zoomed img { max-width: none; max-height: none; object-fit: initial; border-radius: 0; position: absolute; }
+  .source-label { position: absolute; top: 20px; left: 20px; background: rgba(0,0,0,0.7); color: var(--fg); padding: 4px 12px; border-radius: var(--radius); font-size: 12px; font-weight: 600; backdrop-filter: blur(8px); z-index: 1; }
+  .no-preview { color: var(--fg2); font-size: 18px; }
+
+  /* EXIF panel */
+  .exif-panel { width: 280px; background: var(--bg2); border-left: 1px solid var(--bg3); padding: 16px; overflow-y: auto; flex-shrink: 0; font-size: 13px; transition: margin-right 0.2s; }
+  .exif-panel.hidden { display: none; }
+  .exif-panel h3 { font-size: 12px; text-transform: uppercase; color: var(--fg2); letter-spacing: 0.5px; margin-bottom: 12px; }
+  .exif-row { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--bg3); }
+  .exif-label { color: var(--fg2); }
+  .exif-value { color: var(--fg); font-weight: 500; text-align: right; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .exif-value:empty::after { content: "—"; color: var(--bg3); }
+  .geotag-input-row { display: flex; gap: 4px; padding: 6px 0; }
+  .geotag-input-row input { flex: 1; background: var(--bg); border: 1px solid var(--bg3); color: var(--fg); padding: 4px 8px; border-radius: 4px; font-size: 12px; font-family: inherit; outline: none; }
+  .geotag-input-row input:focus { border-color: var(--blue); }
+  .geotag-input-row button { background: var(--blue); color: #fff; border: none; padding: 4px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 600; white-space: nowrap; }
+  .geotag-input-row button:disabled { opacity: 0.5; cursor: default; }
+  .geotag-confirm { padding: 6px 0; font-size: 12px; }
+  .geotag-confirm .geo-name { color: var(--fg); margin-bottom: 6px; line-height: 1.4; }
+  .geotag-confirm .geo-actions { display: flex; gap: 6px; }
+  .geotag-confirm .geo-actions button { padding: 3px 10px; border-radius: 4px; border: none; font-size: 11px; font-weight: 600; cursor: pointer; }
+  .geo-confirm-btn { background: var(--green); color: #fff; }
+  .geo-cancel-btn { background: var(--bg3); color: var(--fg2); }
+
+  /* Bottom bar */
+  .bottombar { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: var(--bg2); border-top: 1px solid var(--bg3); flex-shrink: 0; gap: 12px; }
+  .actions { display: flex; gap: 8px; align-items: center; }
+  .act-btn { border: none; padding: 8px 16px; border-radius: var(--radius); cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
+  .act-btn kbd { background: rgba(255,255,255,0.15); padding: 1px 6px; border-radius: 3px; font-size: 11px; font-family: inherit; }
+  .btn-delete { background: rgba(229,69,69,0.15); color: var(--red); border: 1px solid rgba(229,69,69,0.3); }
+  .btn-delete:hover, .btn-delete.active { background: var(--red); color: #fff; }
+  .btn-jpeg { background: rgba(229,184,69,0.15); color: var(--yellow); border: 1px solid rgba(229,184,69,0.3); }
+  .btn-jpeg:hover, .btn-jpeg.active { background: var(--yellow); color: #000; }
+  .btn-keep { background: rgba(69,184,90,0.15); color: var(--green); border: 1px solid rgba(69,184,90,0.3); }
+  .btn-keep:hover, .btn-keep.active { background: var(--green); color: #fff; }
+  .btn-undo { background: var(--bg3); color: var(--fg2); border: 1px solid transparent; }
+  .btn-undo:hover { color: var(--fg); }
+  .btn-toggle { background: var(--bg3); color: var(--fg2); border: 1px solid transparent; }
+  .btn-toggle:hover { color: var(--fg); }
+  .btn-toggle.active { background: var(--blue); color: #fff; }
+  .btn-audio { background: rgba(180,130,255,0.15); color: #b482ff; border: 1px solid rgba(180,130,255,0.3); min-height: 34px; }
+  .btn-audio:hover, .btn-audio.playing { background: #b482ff; color: #fff; }
+  .btn-audio .ico { display: inline-block; width: 12px; text-align: center; font-size: 10px; }
+  .btn-apply { background: var(--blue); color: #fff; border: 1px solid transparent; font-size: 14px; padding: 8px 20px; }
+  .btn-apply:hover { filter: brightness(1.1); }
+
+  /* Filmstrip */
+  .filmstrip { display: flex; gap: 4px; padding: 8px 12px; background: var(--bg); border-top: 1px solid var(--bg3); overflow-x: auto; flex-shrink: 0; scrollbar-width: thin; scrollbar-color: var(--bg3) transparent; }
+  .filmstrip::-webkit-scrollbar { height: 6px; }
+  .filmstrip::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 3px; }
+  .strip-item { width: 56px; height: 40px; flex-shrink: 0; border-radius: 3px; overflow: hidden; cursor: pointer; border: 2px solid transparent; opacity: 0.85; transition: all 0.15s; position: relative; }
+  .strip-item:hover { opacity: 1; }
+  .strip-item.current { opacity: 1; border-color: var(--fg); box-shadow: 0 0 0 2px var(--fg); }
+  .strip-item.current img { filter: brightness(0.5); }
+  .strip-item.decided-delete { border-color: var(--red); opacity: 0.8; }
+  .strip-item.decided-keep_jpeg { border-color: var(--yellow); opacity: 0.8; }
+  .strip-item.decided-keep_both { border-color: var(--green); opacity: 0.8; }
+  .strip-item img { width: 100%; height: 100%; object-fit: cover; }
+  .strip-item .strip-placeholder { width: 100%; height: 100%; background: var(--bg3); }
+
+  /* Modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+  .modal-overlay.visible { display: flex; }
+  .modal { background: var(--bg2); border: 1px solid var(--bg3); border-radius: 12px; padding: 28px; max-width: 440px; width: 90%; }
+  .modal h2 { font-size: 18px; margin-bottom: 16px; }
+  .modal .summary-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--bg3); font-size: 14px; }
+  .modal .summary-count { font-weight: 700; }
+  .modal .modal-actions { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+  .modal .modal-actions button { padding: 8px 20px; border-radius: var(--radius); border: none; cursor: pointer; font-size: 14px; font-weight: 600; }
+  .modal .btn-cancel { background: var(--bg3); color: var(--fg); }
+  .modal .btn-confirm { background: var(--blue); color: #fff; }
+
+  /* Circular progress */
+  .progress-ring { position: relative; width: 36px; height: 36px; flex-shrink: 0; }
+  .progress-ring svg { transform: rotate(-90deg); }
+  .progress-ring circle { fill: none; stroke-width: 3; }
+  .progress-ring .ring-bg { stroke: var(--bg3); }
+  .progress-ring .ring-fill { stroke: var(--blue); stroke-linecap: round; transition: stroke-dashoffset 0.4s ease; }
+  .progress-pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; color: var(--fg2); }
+
+  @media (max-width: 700px) {
+    .exif-panel { width: 220px; }
+    .act-btn kbd { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-left">
+    <button class="nav-btn" onclick="navigate(-1)" title="Previous (←)">&#9664;</button>
+    <span class="counter" id="counter">0 / 0</span>
+    <button class="nav-btn" onclick="navigate(1)" title="Next (→)">&#9654;</button>
+    <span class="filename" id="filename"></span>
+    <span class="badge" id="pairBadge"></span>
+    <span class="badge" id="decisionBadge"></span>
+  </div>
+  <div class="topbar-right">
+    <div class="progress-ring" id="progressRing" title="Triage progress">
+      <svg width="36" height="36"><circle class="ring-bg" cx="18" cy="18" r="15"/><circle class="ring-fill" id="ringFill" cx="18" cy="18" r="15" stroke-dasharray="94.25" stroke-dashoffset="94.25"/></svg>
+      <span class="progress-pct" id="progressPct">0%</span>
+    </div>
+    <button class="act-btn btn-toggle" id="exifToggle" onclick="toggleExif()" title="Toggle EXIF (I)">EXIF</button>
+    <button class="act-btn btn-apply" onclick="showApply()">Apply</button>
+  </div>
+</div>
+
+<div class="main">
+  <div class="viewer" id="viewer">
+    <img id="mainImg" src="" alt="" draggable="false">
+    <div class="source-label" id="sourceLabel"></div>
+  </div>
+  <div class="exif-panel" id="exifPanel">
+    <h3>EXIF Info</h3>
+    <div id="exifContent"></div>
+  </div>
+</div>
+
+<div class="bottombar">
+  <div class="actions">
+    <button class="act-btn btn-delete" id="btnDelete" onclick="decide('delete')">Delete <kbd>1</kbd></button>
+    <button class="act-btn btn-jpeg" id="btnJpeg" onclick="decide('keep_jpeg')">Keep JPEG/HEIF <kbd>2</kbd></button>
+    <button class="act-btn btn-keep" id="btnKeep" onclick="decide('keep_both')">Keep Both <kbd>3</kbd></button>
+    <button class="act-btn btn-undo" onclick="undo()">Undo <kbd>4</kbd></button>
+  </div>
+  <div class="actions">
+    <button class="act-btn btn-audio" id="audioBtn" onclick="toggleAudio()" style="display:none"><span class="ico">&#9654;</span> Memo <kbd>M</kbd></button>
+    <button class="act-btn btn-toggle" id="sourceToggle" onclick="toggleSource()">RAW Preview <kbd>T</kbd></button>
+  </div>
+</div>
+
+<div class="filmstrip" id="filmstrip"></div>
+
+<!-- Apply modal -->
+<div class="modal-overlay" id="applyModal">
+  <div class="modal">
+    <h2>Apply Triage Decisions</h2>
+    <div id="applySummary"></div>
+    <p style="font-size:12px;color:var(--fg2);margin-top:12px;">Deleted files go to <code>_triage_trash/</code>. Archived RAWs are moved to the archive folder. JPEG/HEIFs and WAVs stay in the import folder.</p>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="hideApply()">Cancel</button>
+      <button class="btn-confirm" onclick="applyDecisions()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let photos = [];
+let idx = 0;
+let viewSource = 'jpeg';  // 'jpeg' or 'raw'
+let zoomed = false;
+let exifVisible = true;
+let capabilities = {};
+const preloaded = {};
+const history = [];  // stack of {idx, decision} for undo
+
+async function init() {
+  const [photosRes, capsRes] = await Promise.all([fetch('/api/photos'), fetch('/api/capabilities')]);
+  photos = await photosRes.json();
+  capabilities = await capsRes.json();
+  buildFilmstrip();
+  if (photos.length > 0) showPhoto(0);
+  else document.getElementById('viewer').innerHTML = '<div class="no-preview">No photos found</div>';
+}
+
+function showPhoto(i) {
+  if (i < 0 || i >= photos.length) return;
+  idx = i;
+  const p = photos[idx];
+
+  // Update UI chrome
+  document.getElementById('counter').textContent = `${idx + 1} / ${photos.length}`;
+  document.getElementById('filename').textContent = p.stem;
+
+  // Pair badge (strip leading dots, color-code by type)
+  const pb = document.getElementById('pairBadge');
+  const rawLabel = p.rawExt ? p.rawExt.replace(/^\./, '') : '';
+  const jpegLabel = p.jpegExt ? p.jpegExt.replace(/^\./, '') : '';
+  if (p.hasRaw && p.hasJpeg) { pb.textContent = `${rawLabel} + ${jpegLabel}`; pb.className = 'badge badge-pair'; }
+  else if (p.hasRaw) { pb.textContent = `${rawLabel} ONLY`; pb.className = 'badge badge-raw'; }
+  else { pb.textContent = `${jpegLabel} ONLY`; pb.className = 'badge badge-lossy'; }
+
+  // Decision badge
+  updateDecisionBadge(p);
+
+  // Action button highlights
+  document.getElementById('btnDelete').classList.toggle('active', p.decision === 'delete');
+  document.getElementById('btnJpeg').classList.toggle('active', p.decision === 'keep_jpeg');
+  document.getElementById('btnKeep').classList.toggle('active', p.decision === 'keep_both');
+
+  // Audio memo button
+  stopAudio();
+  const ab = document.getElementById('audioBtn');
+  ab.style.display = p.hasAudio ? '' : 'none';
+
+  // Grey out "Keep JPEG" for RAW-only files
+  const jb = document.getElementById('btnJpeg');
+  jb.disabled = !p.hasJpeg;
+  jb.style.opacity = p.hasJpeg ? 1 : 0.3;
+
+  // Enable source toggle for paired files OR raw-only files
+  // (raw-only: toggle between embedded thumbnail and developed RAW)
+  const st = document.getElementById('sourceToggle');
+  const canToggle = (p.hasRaw && p.hasJpeg) || (p.hasRaw && !p.hasJpeg);
+  st.disabled = !canToggle;
+  st.style.opacity = st.disabled ? 0.3 : 1;
+  st.textContent = p.hasRaw && !p.hasJpeg
+    ? (viewSource === 'raw' ? 'Show Thumbnail' : 'Develop RAW')
+    : (viewSource === 'raw' ? 'Show JPEG/HEIF' : 'RAW Preview');
+
+  // Reset to JPEG view (embedded thumb) if no RAW
+  if (!p.hasRaw) viewSource = 'jpeg';
+
+  // Reset zoom on navigation
+  resetZoom();
+
+  // Load image
+  loadImage(p);
+
+  // Load EXIF
+  loadExif(p.id);
+
+  // Update filmstrip
+  updateFilmstripCurrent();
+
+  // Preload adjacent
+  preloadAt(idx + 1);
+  preloadAt(idx - 1);
+
+  updateProgress();
+}
+
+function loadImage(p) {
+  const img = document.getElementById('mainImg');
+  const src = viewSource === 'raw' && p.hasRaw ? 'raw' : 'jpeg';
+  const url = `/api/image/${p.id}/${src}`;
+
+  // Source label
+  const label = document.getElementById('sourceLabel');
+  if (p.hasRaw && p.hasJpeg) {
+    label.textContent = src === 'raw' ? 'RAW Developed' : (p.jpegExt || 'JPEG').replace(/^\./, '');
+    label.style.display = '';
+  } else if (p.hasRaw && !p.hasJpeg) {
+    label.textContent = src === 'raw' ? 'RAW Developed' : 'Embedded Thumbnail';
+    label.style.display = '';
+  } else {
+    label.style.display = 'none';
+  }
+
+  // Toggle button state
+  document.getElementById('sourceToggle').classList.toggle('active', src === 'raw');
+
+  if (img.src.endsWith(url)) return;
+  img.classList.add('loading');
+  const newImg = new Image();
+  newImg.onload = () => { img.src = url; img.classList.remove('loading'); };
+  newImg.onerror = () => { img.classList.remove('loading'); };
+  newImg.src = url;
+}
+
+function preloadAt(i) {
+  if (i < 0 || i >= photos.length) return;
+  const p = photos[i];
+  const src = p.hasJpeg ? 'jpeg' : 'raw';
+  const url = `/api/image/${p.id}/${src}`;
+  if (preloaded[url]) return;
+  preloaded[url] = true;
+  const img = new Image();
+  img.src = url;
+}
+
+async function loadExif(id) {
+  const container = document.getElementById('exifContent');
+  container.innerHTML = '<div style="color:var(--fg2)">Loading...</div>';
+  try {
+    const res = await fetch(`/api/exif/${id}`);
+    const data = await res.json();
+    const fields = [
+      ['Date', data.date],
+      ['Camera', data.camera],
+      ['Lens', data.lens],
+      ['Focal Length', data.focalLength],
+      ['Aperture', data.aperture ? `f/${data.aperture}` : ''],
+      ['Shutter', data.shutterSpeed],
+      ['ISO', data.iso],
+      ['Film Simulation', data.filmSimulation],
+      ['White Balance', data.whiteBalance],
+      ['Exp. Comp.', data.exposureComp],
+      ['Metering', data.meteringMode],
+      ['Focus', data.focusMode],
+      ['Dynamic Range', data.dynamicRange],
+      ['Resolution', data.resolution],
+    ];
+    let html = fields.map(([l, v]) =>
+      `<div class="exif-row"><span class="exif-label">${l}</span><span class="exif-value">${v || ''}</span></div>`
+    ).join('');
+
+    // GPS row: show coordinates with Apple Maps link, or geotag input
+    if (data.gpsLatitude && data.gpsLongitude) {
+      const lat = parseFloat(data.gpsLatitude).toFixed(4);
+      const lon = parseFloat(data.gpsLongitude).toFixed(4);
+      const mapsUrl = `https://maps.apple.com/?ll=${data.gpsLatitude},${data.gpsLongitude}&q=${lat},${lon}`;
+      html += `<div class="exif-row"><span class="exif-label">Location</span><span class="exif-value"><a href="${mapsUrl}" target="_blank" style="color:var(--blue);text-decoration:none" title="Open in Apple Maps">${lat}, ${lon}</a></span></div>`;
+    } else if (capabilities.exiftool) {
+      html += `<div class="geotag-row" id="geotagRow">
+        <div class="exif-row"><span class="exif-label">Location</span><span class="exif-value" style="color:var(--fg2)">No GPS</span></div>
+        <div class="geotag-input-row" id="geotagInput">
+          <input type="text" id="geoQuery" placeholder="Type address..." spellcheck="false">
+          <button onclick="geocodeCurrentPhoto()" id="geoBtn">Set</button>
+        </div>
+        <div id="geotagConfirm" style="display:none"></div>
+      </div>`;
+    } else {
+      html += `<div class="exif-row"><span class="exif-label">Location</span><span class="exif-value" style="color:var(--fg2)">No GPS</span></div>`;
+    }
+
+    container.innerHTML = html;
+  } catch {
+    container.innerHTML = '<div style="color:var(--fg2)">Could not load EXIF</div>';
+  }
+}
+
+async function decide(decision) {
+  const p = photos[idx];
+  if (!p.hasJpeg && decision === 'keep_jpeg') return;
+
+  // Record previous state for undo
+  history.push({ idx, previousDecision: p.decision || null });
+
+  await fetch('/api/decide', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: p.id, decision }),
+  });
+
+  p.decision = decision;
+  refreshCurrentUI();
+
+  // Auto-advance on decision
+  if (decision && idx < photos.length - 1) {
+    setTimeout(() => navigate(1), 150);
+  }
+}
+
+async function undo() {
+  if (history.length === 0) return;
+  const entry = history.pop();
+
+  // Restore previous decision on the server
+  await fetch('/api/decide', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: photos[entry.idx].id, decision: entry.previousDecision }),
+  });
+
+  photos[entry.idx].decision = entry.previousDecision;
+
+  // Update filmstrip border for the undone photo
+  const item = document.querySelector(`.strip-item[data-idx="${entry.idx}"]`);
+  if (item) {
+    item.className = 'strip-item' + (entry.previousDecision ? ` decided-${entry.previousDecision}` : '');
+  }
+
+  // Navigate back to that photo
+  showPhoto(entry.idx);
+}
+
+function refreshCurrentUI() {
+  const p = photos[idx];
+  updateDecisionBadge(p);
+  document.getElementById('btnDelete').classList.toggle('active', p.decision === 'delete');
+  document.getElementById('btnJpeg').classList.toggle('active', p.decision === 'keep_jpeg');
+  document.getElementById('btnKeep').classList.toggle('active', p.decision === 'keep_both');
+
+  // Update filmstrip item
+  const item = document.querySelector(`.strip-item[data-idx="${idx}"]`);
+  if (item) {
+    item.className = 'strip-item current' + (p.decision ? ` decided-${p.decision}` : '');
+  }
+
+  updateProgress();
+}
+
+function updateDecisionBadge(p) {
+  const db = document.getElementById('decisionBadge');
+  if (p.decision) {
+    const labels = { delete: 'Delete', keep_jpeg: 'Keep JPEG', keep_both: 'Keep Both' };
+    db.textContent = labels[p.decision];
+    db.className = `badge badge-${p.decision}`;
+    db.style.display = '';
+  } else {
+    db.style.display = 'none';
+  }
+}
+
+// Geotag functions
+let pendingGeo = null; // { lat, lon, displayName }
+
+async function geocodeCurrentPhoto() {
+  const input = document.getElementById('geoQuery');
+  const btn = document.getElementById('geoBtn');
+  const confirm = document.getElementById('geotagConfirm');
+  if (!input || !input.value.trim()) return;
+
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    const res = await fetch('/api/geocode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: input.value.trim() }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Geocoding failed');
+      return;
+    }
+    pendingGeo = data;
+    // Show confirmation
+    document.getElementById('geotagInput').style.display = 'none';
+    confirm.innerHTML = `<div class="geotag-confirm">
+      <div class="geo-name">${data.displayName}</div>
+      <div style="color:var(--fg2);margin-bottom:6px">${data.lat}, ${data.lon}</div>
+      <div class="geo-actions">
+        <button class="geo-confirm-btn" onclick="applyGeotag()">Confirm</button>
+        <button class="geo-cancel-btn" onclick="cancelGeotag()">Cancel</button>
+      </div>
+    </div>`;
+    confirm.style.display = '';
+  } catch (e) {
+    alert('Geocoding error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Set';
+  }
+}
+
+async function applyGeotag() {
+  if (!pendingGeo) return;
+  const p = photos[idx];
+  try {
+    const res = await fetch('/api/geotag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: p.id, lat: pendingGeo.lat, lon: pendingGeo.lon }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Geotagging failed');
+      return;
+    }
+    pendingGeo = null;
+    // Reload EXIF to show the new coordinates
+    loadExif(p.id);
+  } catch (e) {
+    alert('Geotagging error: ' + e.message);
+  }
+}
+
+function cancelGeotag() {
+  pendingGeo = null;
+  const input = document.getElementById('geotagInput');
+  const confirm = document.getElementById('geotagConfirm');
+  if (input) input.style.display = '';
+  if (confirm) confirm.style.display = 'none';
+}
+
+function updateProgress() {
+  const decided = photos.filter(p => p.decision).length;
+  const pct = photos.length ? Math.round((decided / photos.length) * 100) : 0;
+  const circumference = 94.25; // 2 * PI * 15
+  document.getElementById('ringFill').style.strokeDashoffset = circumference - (circumference * pct / 100);
+  document.getElementById('progressPct').textContent = `${pct}%`;
+}
+
+function navigate(dir) {
+  const next = idx + dir;
+  if (next >= 0 && next < photos.length) showPhoto(next);
+}
+
+function toggleSource() {
+  const p = photos[idx];
+  if (!p.hasRaw) return;
+  resetZoom();
+  viewSource = viewSource === 'jpeg' ? 'raw' : 'jpeg';
+  loadImage(p);
+  // Update toggle button label
+  const st = document.getElementById('sourceToggle');
+  st.textContent = p.hasRaw && !p.hasJpeg
+    ? (viewSource === 'raw' ? 'Show Thumbnail' : 'Develop RAW')
+    : (viewSource === 'raw' ? 'Show JPEG/HEIF' : 'RAW Preview');
+}
+
+// Audio memo playback
+let audioEl = null;
+
+function toggleAudio() {
+  const p = photos[idx];
+  if (!p.hasAudio) return;
+  const btn = document.getElementById('audioBtn');
+  if (audioEl && !audioEl.paused) {
+    stopAudio();
+  } else {
+    audioEl = new Audio(`/api/audio/${p.id}`);
+    audioEl.play();
+    btn.classList.add('playing');
+    btn.querySelector('.ico').innerHTML = '&#9724;';
+    audioEl.onended = () => {
+      btn.classList.remove('playing');
+      btn.querySelector('.ico').innerHTML = '&#9654;';
+    };
+  }
+}
+
+function stopAudio() {
+  const btn = document.getElementById('audioBtn');
+  if (audioEl) {
+    audioEl.pause();
+    audioEl = null;
+  }
+  btn.classList.remove('playing');
+  const ico = btn.querySelector('.ico');
+  if (ico) ico.innerHTML = '&#9654;';
+}
+
+function toggleExif() {
+  exifVisible = !exifVisible;
+  document.getElementById('exifPanel').classList.toggle('hidden', !exifVisible);
+  document.getElementById('exifToggle').classList.toggle('active', exifVisible);
+}
+
+// Zoom to 100%
+function toggleZoom(e) {
+  const viewer = document.getElementById('viewer');
+  const img = document.getElementById('mainImg');
+  if (!img.naturalWidth) return;
+
+  if (!zoomed) {
+    zoomed = true;
+    viewer.classList.add('zoomed');
+    const vw = viewer.clientWidth;
+    const vh = viewer.clientHeight;
+    const nw = img.naturalWidth;
+    const nh = img.naturalHeight;
+
+    // Compute where the click was relative to the displayed (fitted) image
+    const scale = Math.min(vw / nw, vh / nh, 1);
+    const dispW = nw * scale;
+    const dispH = nh * scale;
+    const imgLeft = (vw - dispW) / 2;
+    const imgTop = (vh - dispH) / 2;
+
+    // Click position relative to image content (0..1)
+    let rx = 0.5, ry = 0.5;
+    if (e && e.clientX !== undefined) {
+      const rect = viewer.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      rx = Math.max(0, Math.min(1, (cx - imgLeft) / dispW));
+      ry = Math.max(0, Math.min(1, (cy - imgTop) / dispH));
+    }
+
+    // Position so clicked point stays at same screen position
+    const screenX = e && e.clientX !== undefined ? e.clientX - viewer.getBoundingClientRect().left : vw / 2;
+    const screenY = e && e.clientY !== undefined ? e.clientY - viewer.getBoundingClientRect().top : vh / 2;
+    let left = screenX - rx * nw;
+    let top = screenY - ry * nh;
+
+    // Clamp so we don't show blank space
+    left = Math.min(0, Math.max(vw - nw, left));
+    top = Math.min(0, Math.max(vh - nh, top));
+
+    img.style.width = nw + 'px';
+    img.style.height = nh + 'px';
+    img.style.left = left + 'px';
+    img.style.top = top + 'px';
+
+    updateSourceLabel();
+  } else {
+    resetZoom();
+  }
+}
+
+function resetZoom() {
+  if (!zoomed) return;
+  zoomed = false;
+  const viewer = document.getElementById('viewer');
+  const img = document.getElementById('mainImg');
+  viewer.classList.remove('zoomed', 'dragging');
+  img.style.width = '';
+  img.style.height = '';
+  img.style.left = '';
+  img.style.top = '';
+  updateSourceLabel();
+}
+
+function updateSourceLabel() {
+  const label = document.getElementById('sourceLabel');
+  if (!label) return;
+  if (zoomed) {
+    label.textContent = label.textContent.replace(/ · 100%$/, '') || '100%';
+    label.textContent += label.textContent === '100%' ? '' : ' · 100%';
+    label.style.display = '';
+  } else {
+    label.textContent = label.textContent.replace(/ · 100%$/, '');
+    // Re-hide if it was only showing for zoom on a JPEG-only file
+    if (!label.textContent) label.style.display = 'none';
+  }
+}
+
+// Pan (drag) when zoomed
+(function() {
+  const viewer = document.getElementById('viewer');
+  let dragging = false;
+  let dragStartX, dragStartY, imgStartLeft, imgStartTop, dragMoved;
+
+  viewer.addEventListener('mousedown', (e) => {
+    if (!zoomed || e.button !== 0) return;
+    e.preventDefault();
+    dragging = true;
+    dragMoved = false;
+    viewer.classList.add('dragging');
+    const img = document.getElementById('mainImg');
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    imgStartLeft = parseInt(img.style.left) || 0;
+    imgStartTop = parseInt(img.style.top) || 0;
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - dragStartX;
+    const dy = e.clientY - dragStartY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved = true;
+    const img = document.getElementById('mainImg');
+    const vw = viewer.clientWidth;
+    const vh = viewer.clientHeight;
+    const nw = img.naturalWidth;
+    const nh = img.naturalHeight;
+    let left = imgStartLeft + dx;
+    let top = imgStartTop + dy;
+    left = Math.min(0, Math.max(vw - nw, left));
+    top = Math.min(0, Math.max(vh - nh, top));
+    img.style.left = left + 'px';
+    img.style.top = top + 'px';
+  });
+
+  // Suppress the click event that fires after a mouseup-triggered unzoom
+  let suppressNextClick = false;
+
+  window.addEventListener('mouseup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    viewer.classList.remove('dragging');
+    if (!dragMoved) { suppressNextClick = true; toggleZoom(e); }
+  });
+
+  viewer.addEventListener('click', (e) => {
+    if (suppressNextClick) { suppressNextClick = false; return; }
+    if (zoomed) return;
+    if (e.target.tagName === 'IMG') toggleZoom(e);
+  });
+})();
+
+// Filmstrip
+function buildFilmstrip() {
+  const strip = document.getElementById('filmstrip');
+  strip.innerHTML = photos.map((p, i) =>
+    `<div class="strip-item" data-idx="${i}" onclick="showPhoto(${i})"><div class="strip-placeholder"></div></div>`
+  ).join('');
+
+  // Lazy-load thumbnails
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (!e.isIntersecting) return;
+      const el = e.target;
+      const i = parseInt(el.dataset.idx);
+      const img = document.createElement('img');
+      img.src = `/api/thumb/${photos[i].id}`;
+      img.loading = 'lazy';
+      el.innerHTML = '';
+      el.appendChild(img);
+      observer.unobserve(el);
+    });
+  }, { root: strip, rootMargin: '200px' });
+
+  strip.querySelectorAll('.strip-item').forEach(el => observer.observe(el));
+}
+
+function updateFilmstripCurrent() {
+  document.querySelectorAll('.strip-item.current').forEach(el => el.classList.remove('current'));
+  const item = document.querySelector(`.strip-item[data-idx="${idx}"]`);
+  if (item) {
+    item.classList.add('current');
+    item.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+  }
+}
+
+// Apply modal
+async function showApply() {
+  const res = await fetch('/api/summary');
+  const s = await res.json();
+  document.getElementById('applySummary').innerHTML = `
+    <div class="summary-row"><span style="color:var(--red)">Delete all files</span><span class="summary-count">${s.delete}</span></div>
+    <div class="summary-row"><span style="color:var(--yellow)">Keep JPEG/HEIF only (trash RAW)</span><span class="summary-count">${s.keepJpeg}</span></div>
+    <div class="summary-row"><span style="color:var(--green)">Keep both (archive RAW)</span><span class="summary-count">${s.keepBoth}</span></div>
+    <div class="summary-row"><span style="color:var(--fg2)">Undecided (no action)</span><span class="summary-count">${s.undecided}</span></div>
+  `;
+  document.getElementById('applyModal').classList.add('visible');
+}
+
+function hideApply() {
+  document.getElementById('applyModal').classList.remove('visible');
+}
+
+async function applyDecisions() {
+  const res = await fetch('/api/apply', { method: 'POST' });
+  const r = await res.json();
+  hideApply();
+  let msg = `Done! Trashed ${r.trashed} file(s).`;
+  if (r.archived > 0) msg += ` Archived ${r.archived} RAW(s) to ${r.archiveDir}.`;
+  alert(msg);
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+    if (e.key === 'Enter' && e.target.id === 'geoQuery') geocodeCurrentPhoto();
+    return;
+  }
+  if (document.getElementById('applyModal').classList.contains('visible')) {
+    if (e.key === 'Escape') hideApply();
+    return;
+  }
+  switch (e.key) {
+    case 'ArrowLeft':  e.preventDefault(); navigate(-1); break;
+    case 'ArrowRight': e.preventDefault(); navigate(1); break;
+    case ' ':          e.preventDefault(); navigate(1); break;
+    case '1':          decide('delete'); break;
+    case '2':          decide('keep_jpeg'); break;
+    case '3':          decide('keep_both'); break;
+    case '4':          undo(); break;
+    case 't': case 'T': toggleSource(); break;
+    case 'i': case 'I': toggleExif(); break;
+    case 'm': case 'M': toggleAudio(); break;
+    case 'z': case 'Z': toggleZoom(); break;
+    case 'Enter':      showApply(); break;
+  }
+});
+
+// Close modal on backdrop click
+document.getElementById('applyModal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) hideApply();
+});
+
+init();
+</script>
+</body>
+</html>
