@@ -1,6 +1,6 @@
 # RAW Triage
 
-A local web-based tool for quickly triaging standalone or paired RAW + JPEG/HEIF photo files. Built for Fujifilm shooters who shoot RAW+JPEG and want a fast way to decide what to keep.
+A local web-based tool for quickly triaging standalone or paired RAW & JPEG/HEIF photo files. Built (by and) for Fujifilm shooters who shoot RAW+Lossy and want a fast way to decide what to keep.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
