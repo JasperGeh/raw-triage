@@ -2,17 +2,23 @@
 """RAW+JPEG Photo Triage Tool — quickly sort through paired RAW/JPEG files."""
 
 import argparse
+import filecmp
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import webbrowser
+from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 from flask import Flask, render_template, jsonify, send_file, request, abort
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 app = Flask(__name__)
 
@@ -20,9 +26,57 @@ app = Flask(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 TRASH_DIR_NAME = "_triage_trash"
+STATE_FILE_NAME = ".raw-triage.json"   # dotfile, so scan() ignores it
 RAW_EXTS = {".raf"}
 JPEG_EXTS = {".jpg", ".jpeg", ".hif", ".heif", ".heic"}
 AUDIO_EXTS = {".wav"}
+DECISIONS = {"delete", "keep_jpeg", "keep_both"}
+FAVORITE_KEYWORD = "Favorite"   # the one keyword written to favourites on Apply
+
+# Clipping: 8-bit JPEG levels treated as clipped (a little slack for JPEG compression noise),
+# and the fraction of the sensor's range above which a RAW photosite counts as clipped.
+CLIP_HIGH = 252
+CLIP_LOW = 3
+RAW_SAT_FRACTION = 0.98
+
+# Focus peaking: band-pass threshold (0–255) per sensitivity level (1 = low, 3 = high).
+# Calibrated on synthetic images; tune against your own files if needed.
+PEAKING_THRESHOLDS = {1: 30, 2: 20, 3: 12}
+
+# exiftool's printed Orientation values -> EXIF orientation numbers
+ORIENTATIONS = {"Horizontal (normal)": 1, "Rotate 180": 3, "Rotate 90 CW": 6, "Rotate 270 CW": 8}
+
+
+# ---------------------------------------------------------------------------
+# Caching
+# ---------------------------------------------------------------------------
+class ByteCache:
+    """Thread-safe LRU cache for encoded images, bounded by total size."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._items: OrderedDict[str, bytes] = OrderedDict()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> bytes | None:
+        with self._lock:
+            value = self._items.get(key)
+            if value is not None:
+                self._items.move_to_end(key)
+            return value
+
+    def put(self, key: str, value: bytes) -> None:
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._size -= len(old)
+            self._items[key] = value
+            self._size += len(value)
+            while self._size > self.max_bytes and len(self._items) > 1:
+                _, evicted = self._items.popitem(last=False)
+                self._size -= len(evicted)
+
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -32,7 +86,18 @@ archive_dir: Path | None = None
 photos: list = []          # ordered list of PhotoGroup
 photo_map: dict = {}       # id -> PhotoGroup
 decisions: dict = {}       # id -> "delete" | "keep_jpeg" | "keep_both"
-cache: dict = {}           # arbitrary cache keyed by string
+favorites: set = set()     # ids marked as favourite
+imported: set = set()      # ids whose JPEG/HEIF was already imported into Apple Photos
+photos_album: str = ""     # default Apple Photos album for imports ("" = none)
+image_cache = ByteCache(1024 * 1024 * 1024)  # large previews (HEIF, RAW, peaking)
+thumb_cache: dict = {}     # id -> thumbnail bytes
+exif_cache: dict = {}      # id -> parsed EXIF dict
+jpeg_clip_cache: dict = {} # id -> JPEG clipping stats
+raw_clip_cache: dict = {}  # RAW path -> (stats, clipping mask as PNG bytes)
+state_lock = threading.Lock()
+apply_lock = threading.Lock()
+
+HAS_PHOTOS = sys.platform == "darwin"   # Apple Photos import via AppleScript
 
 HAS_HEIF = False
 try:
@@ -83,6 +148,7 @@ class PhotoGroup:
             "rawExt": self.raw_path.suffix.upper() if self.raw_path else None,
             "jpegExt": self.jpeg_path.suffix.upper() if self.jpeg_path else None,
             "decision": decisions.get(self.id),
+            "favorite": self.id in favorites,
         }
 
 
@@ -104,6 +170,8 @@ def scan(directory: Path) -> None:
         if ext in RAW_EXTS:
             stems[stem]["raw"] = f
         elif ext in JPEG_EXTS:
+            if stems[stem]["jpeg"] is not None:
+                print(f"Warning: several JPEG/HEIF files for {stem}; only {f.name} will be triaged")
             stems[stem]["jpeg"] = f
         elif ext in AUDIO_EXTS:
             stems[stem]["audio"] = f
@@ -122,66 +190,102 @@ def scan(directory: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Persistent state (decisions + favourites survive restarts)
+# ---------------------------------------------------------------------------
+def load_state() -> None:
+    path = source_dir / STATE_FILE_NAME
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        print(f"Warning: could not read {path}: {e}")
+        return
+    for pid, d in data.get("decisions", {}).items():
+        if pid in photo_map and d in DECISIONS:
+            decisions[pid] = d
+    favorites.update(pid for pid in data.get("favorites", []) if pid in photo_map)
+    imported.update(pid for pid in data.get("imported", []) if pid in photo_map)
+    if decisions or favorites:
+        print(f"Resumed {len(decisions)} decision(s) and {len(favorites)} favourite(s) from {path.name}")
+
+
+def save_state() -> None:
+    path = source_dir / STATE_FILE_NAME
+    with state_lock:
+        data = {
+            "version": 2,
+            "decisions": {k: v for k, v in decisions.items() if k in photo_map},
+            "favorites": sorted(k for k in favorites if k in photo_map),
+            "imported": sorted(k for k in imported if k in photo_map),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f"Warning: could not save triage state to {path}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Image helpers
 # ---------------------------------------------------------------------------
-def _jpeg_bytes_for(path: Path) -> bytes | None:
-    """Return JPEG bytes for a JPEG/HEIF file, converting if needed."""
-    ext = path.suffix.lower()
-    if ext in {".jpg", ".jpeg"}:
-        return path.read_bytes()
-    # HEIF → JPEG conversion
-    ck = f"heif:{path}"
-    if ck in cache:
-        return cache[ck]
-    data = _convert_heif(path)
-    if data:
-        cache[ck] = data
-    return data
+def _encode_jpeg(img: Image.Image, quality: int, icc: bytes | None = None) -> bytes:
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, icc_profile=icc)
+    return buf.getvalue()
 
 
 def _convert_heif(path: Path) -> bytes | None:
+    ck = f"heif:{path}"
+    data = image_cache.get(ck)
+    if data:
+        return data
+    data = None
     if HAS_HEIF:
         try:
             img = Image.open(path)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=95)
-            return buf.getvalue()
+            data = _encode_jpeg(img, 95, img.info.get("icc_profile"))
         except Exception:
-            pass
-    # Fallback: macOS sips
-    try:
-        import tempfile
-        tmp = tempfile.mktemp(suffix=".jpg")
-        subprocess.run(
-            ["sips", "-s", "format", "jpeg", str(path), "--out", tmp],
-            capture_output=True, check=True, timeout=15,
-        )
-        data = Path(tmp).read_bytes()
-        os.unlink(tmp)
-        return data
-    except Exception:
-        return None
+            data = None
+    if not data:
+        # Fallback: macOS sips
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            try:
+                subprocess.run(
+                    ["sips", "-s", "format", "jpeg", str(path), "--out", str(tmp_path)],
+                    capture_output=True, check=True, timeout=15,
+                )
+                data = tmp_path.read_bytes()
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        except Exception:
+            return None
+    image_cache.put(ck, data)
+    return data
 
 
 def _extract_raf_thumb(path: Path) -> bytes | None:
     """Extract the embedded JPEG preview (has film simulation applied)."""
     ck = f"raf:{path}"
-    if ck in cache:
-        return cache[ck]
+    data = image_cache.get(ck)
+    if data:
+        return data
     if not HAS_RAWPY:
         return None
     try:
         with rawpy.imread(str(path)) as raw:
             thumb = raw.extract_thumb()
             if thumb.format is rawpy.ThumbFormat.JPEG:
-                cache[ck] = thumb.data
-                return thumb.data
-            img = Image.fromarray(thumb.data)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-            data = buf.getvalue()
-            cache[ck] = data
-            return data
+                data = thumb.data
+            else:
+                data = _encode_jpeg(Image.fromarray(thumb.data), 90)
+        image_cache.put(ck, data)
+        return data
     except Exception as e:
         print(f"Warning: RAF thumb extraction failed for {path}: {e}")
         return None
@@ -193,8 +297,9 @@ def _develop_raw(path: Path) -> bytes | None:
     Uses half_size=True for speed (~6 MP on a 26 MP Fuji sensor).
     """
     ck = f"dev:{path}"
-    if ck in cache:
-        return cache[ck]
+    data = image_cache.get(ck)
+    if data:
+        return data
     if not HAS_RAWPY:
         return None
     try:
@@ -203,48 +308,206 @@ def _develop_raw(path: Path) -> bytes | None:
                 use_camera_wb=True,
                 half_size=True,
                 no_auto_bright=False,
+                auto_bright_thr=0.001,   # default 1% would fake highlight clipping in the preview
                 output_bps=8,
             )
-        img = Image.fromarray(rgb)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90)
-        data = buf.getvalue()
-        cache[ck] = data
+        data = _encode_jpeg(Image.fromarray(rgb), 90)
+        image_cache.put(ck, data)
         return data
     except Exception as e:
         print(f"Warning: RAW development failed for {path}: {e}")
         return None
 
 
-def _make_thumbnail(data: bytes, size: int = 200) -> bytes:
-    ck = f"thumb:{hash(data)}:{size}"
-    if ck in cache:
-        return cache[ck]
-    img = Image.open(io.BytesIO(data))
+def _source_image(group: PhotoGroup, source: str) -> Path | bytes | None:
+    """What the viewer shows for `source` ("jpeg" | "raw"): a JPEG file path or JPEG bytes."""
+    if source == "raw" and group.raw_path:
+        # Develop RAW with neutral settings (no film sim)
+        return _develop_raw(group.raw_path)
+    if group.jpeg_path:
+        if group.jpeg_path.suffix.lower() in {".jpg", ".jpeg"}:
+            return group.jpeg_path if group.jpeg_path.exists() else None
+        return _convert_heif(group.jpeg_path)
+    if group.raw_path:
+        # No JPEG file — fall back to embedded RAF thumbnail
+        return _extract_raf_thumb(group.raw_path)
+    return None
+
+
+def _open_image(src: Path | bytes) -> Image.Image:
+    return Image.open(src if isinstance(src, Path) else io.BytesIO(src))
+
+
+def _make_thumbnail(group: PhotoGroup, size: int = 200) -> bytes | None:
+    if group.id in thumb_cache:
+        return thumb_cache[group.id]
+    # Open JPEG/HEIF straight from disk rather than via a full-size conversion
+    src = group.jpeg_path if group.jpeg_path and group.jpeg_path.exists() else _source_image(group, "jpeg")
+    if src is None:
+        return None
+    img = _open_image(src)
+    img.draft("RGB", (size, size))   # JPEG only: decode at 1/2–1/8 scale, much faster
+    icc = img.info.get("icc_profile")
+    img = ImageOps.exif_transpose(img)  # otherwise portrait shots appear sideways
     img.thumbnail((size, size))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=70)
-    out = buf.getvalue()
-    cache[ck] = out
+    out = _encode_jpeg(img, 70, icc)
+    thumb_cache[group.id] = out
     return out
 
 
-def _best_image(group: PhotoGroup) -> bytes | None:
-    """Return best available image bytes (JPEG preferred)."""
-    if group.jpeg_path:
-        return _jpeg_bytes_for(group.jpeg_path)
-    if group.raw_path:
-        return _extract_raf_thumb(group.raw_path)
-    return None
+def _peaking_image(group: PhotoGroup, source: str, level: int) -> bytes | None:
+    """Render the image as dimmed greyscale with in-focus detail highlighted in red."""
+    ck = f"peak:{group.id}:{source}:{level}"
+    data = image_cache.get(ck)
+    if data:
+        return data
+    src = _source_image(group, source)
+    if src is None:
+        return None
+    img = ImageOps.exif_transpose(_open_image(src))
+    lum = img.convert("L")
+
+    # Band-pass (difference of Gaussians): the small blur suppresses pixel noise, the large one
+    # removes everything but fine detail, so soft (defocused) edges respond only weakly.
+    band = ImageChops.difference(lum.filter(ImageFilter.GaussianBlur(0.7)),
+                                 lum.filter(ImageFilter.GaussianBlur(1.8)))
+    thr = PEAKING_THRESHOLDS[level]
+    mask = np.array(band.point([0] * (thr + 1) + [255] * (255 - thr)))
+
+    # 3x3 dilation so highlights stay visible when the browser scales the image down to fit
+    np.maximum(mask[1:], mask[:-1], out=mask[1:])
+    np.maximum(mask[:-1], mask[1:], out=mask[:-1])
+    np.maximum(mask[:, 1:], mask[:, :-1], out=mask[:, 1:])
+    np.maximum(mask[:, :-1], mask[:, 1:], out=mask[:, :-1])
+
+    grey = np.asarray(lum.point([v * 45 // 100 for v in range(256)]))
+    red = Image.fromarray(np.maximum(grey, mask))
+    green_blue = Image.fromarray(np.minimum(grey, ~mask))
+    data = _encode_jpeg(Image.merge("RGB", (red, green_blue, green_blue)), 85)
+    image_cache.put(ck, data)
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Clipping / RAW headroom
+# ---------------------------------------------------------------------------
+def _jpeg_clip_masks(img: Image.Image) -> tuple:
+    """Masks of pixels with some channel clipped, all channels clipped, and crushed shadows."""
+    rgb = np.asarray(img.convert("RGB"))
+    high = rgb >= CLIP_HIGH
+    return high.any(axis=2), high.all(axis=2), (rgb <= CLIP_LOW).all(axis=2)
+
+
+def _pct(mask: np.ndarray) -> float:
+    return round(100 * float(mask.mean()), 2)
+
+
+def _jpeg_clip_stats(group: PhotoGroup) -> dict | None:
+    if group.id in jpeg_clip_cache:
+        return jpeg_clip_cache[group.id]
+    src = _source_image(group, "jpeg")
+    if src is None:
+        return None
+    img = _open_image(src)
+    img.draft("RGB", (img.width // 2, img.height // 2))   # half-scale decode is plenty for stats
+    some, blown, shadows = _jpeg_clip_masks(img)
+    stats = {"highlights": _pct(some), "blown": _pct(blown), "shadows": _pct(shadows)}
+    jpeg_clip_cache[group.id] = stats
+    return stats
+
+
+def _raw_clipping(path: Path) -> tuple[dict, bytes] | None:
+    """Clipping measured on the RAW sensor data, before white balance, demosaicing or tone curve.
+
+    Returns stats (clipped area in %, highlight headroom in EV) and a mask of clipped areas
+    (PNG, oriented like the developed image).
+    """
+    if path in raw_clip_cache:
+        return raw_clip_cache[path]
+    if not HAS_RAWPY:
+        return None
+    try:
+        with rawpy.imread(str(path)) as raw:
+            data = raw.raw_image_visible
+            black = float(np.mean(raw.black_level_per_channel))
+            white = float(raw.white_level)
+            flip = raw.sizes.flip
+            sat = black + RAW_SAT_FRACTION * (white - black)
+            # Clipped area in 3x3 blocks: every 3x3 block of the X-Trans (and Bayer) pattern holds
+            # all three colours, so this is comparable to "some channel clipped" in the JPEG.
+            h, w = data.shape[0] // 3 * 3, data.shape[1] // 3 * 3
+            blocks = (data[:h, :w] >= sat).reshape(h // 3, 3, w // 3, 3).any(axis=(1, 3))
+            # How far the brightest highlights sit below saturation (prime stride mixes all colours)
+            sample = data.ravel()[::7].astype(np.float32) - black
+            brightest = float(np.percentile(sample, 99.9))
+    except Exception as e:
+        print(f"Warning: RAW clipping analysis failed for {path}: {e}")
+        return None
+    headroom = max(0.0, math.log2((white - black) / max(brightest, 1.0)))
+    if flip == 3:
+        blocks = blocks[::-1, ::-1]
+    elif flip == 5:
+        blocks = np.rot90(blocks)        # 90° counter-clockwise
+    elif flip == 6:
+        blocks = np.rot90(blocks, -1)    # 90° clockwise
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(blocks)).save(buf, format="PNG")
+    result = ({"clipped": _pct(blocks), "headroomEv": round(headroom, 1)}, buf.getvalue())
+    raw_clip_cache[path] = result
+    return result
+
+
+def _headroom_verdict(jpeg: dict | None, raw: dict | None) -> dict | None:
+    """Rough call on whether the RAW holds highlight detail the JPEG lost."""
+    if not jpeg or not raw:
+        return None
+    clipped = jpeg["highlights"]
+    if clipped < 0.1:
+        return {"level": "ok", "text": "JPEG highlights are fine"}
+    recoverable = max(0.0, clipped - raw["clipped"])
+    if recoverable >= clipped / 2:
+        return {"level": "raw", "text": f"RAW recovers most clipped highlights (~{recoverable:.1f}% of frame)"}
+    return {"level": "lost", "text": "Highlights are clipped in the RAW too"}
+
+
+def _clipping_image(group: PhotoGroup, source: str) -> bytes | None:
+    """The image with clipped areas painted in.
+
+    JPEG view: red = all channels clipped, orange = some channels clipped, blue = crushed shadows.
+    RAW view: red = clipped on the sensor (gone for good).
+    """
+    ck = f"clip:{group.id}:{source}"
+    data = image_cache.get(ck)
+    if data:
+        return data
+    src = _source_image(group, source)
+    if src is None:
+        return None
+    img = ImageOps.exif_transpose(_open_image(src)).convert("RGB")
+    if source == "raw" and group.raw_path:
+        res = _raw_clipping(group.raw_path)
+        layers = []
+        if res:
+            mask = Image.open(io.BytesIO(res[1])).resize(img.size, Image.NEAREST)
+            layers = [(mask, (255, 0, 0))]
+    else:
+        some, blown, shadows = _jpeg_clip_masks(img)
+        layers = [(shadows, (40, 90, 255)), (some & ~blown, (255, 150, 0)), (blown, (255, 0, 0))]
+    for mask, colour in layers:
+        if not isinstance(mask, Image.Image):
+            mask = Image.fromarray(mask)
+        img = Image.composite(Image.new("RGB", img.size, colour), img, mask)
+    data = _encode_jpeg(img, 85)
+    image_cache.put(ck, data)
+    return data
 
 
 # ---------------------------------------------------------------------------
 # EXIF
 # ---------------------------------------------------------------------------
 def _get_exif(photo_id: str) -> dict:
-    ck = f"exif:{photo_id}"
-    if ck in cache:
-        return cache[ck]
+    if photo_id in exif_cache:
+        return exif_cache[photo_id]
     group = photo_map.get(photo_id)
     if not group:
         return {}
@@ -252,7 +515,7 @@ def _get_exif(photo_id: str) -> dict:
     exif = _exif_exiftool(path) if HAS_EXIFTOOL else {}
     if not exif:
         exif = _exif_pillow(path)
-    cache[ck] = exif
+    exif_cache[photo_id] = exif
     return exif
 
 
@@ -273,6 +536,54 @@ def _parse_exiftool_gps(val, ref: str = "") -> str:
         return ""
 
 
+def _af_point(d: dict) -> list | None:
+    """Fujifilm AF point as fractions [x, y] of the displayed (orientation-corrected) image.
+
+    FocusPixel is stored in unrotated pixel coordinates of the image described by
+    ExifImageWidth/Height (the full-size JPEG, or the RAF's embedded preview).
+    """
+    try:
+        x, y = (float(v) for v in str(d["FocusPixel"]).split())
+        u, v = x / float(d["ExifImageWidth"]), y / float(d["ExifImageHeight"])
+    except (KeyError, ValueError, ZeroDivisionError):
+        return None
+    if not (0 < u <= 1 and 0 < v <= 1):
+        return None
+    orientation = ORIENTATIONS.get(d.get("Orientation"), 1)
+    if orientation == 3:
+        u, v = 1 - u, 1 - v
+    elif orientation == 6:
+        u, v = 1 - v, u
+    elif orientation == 8:
+        u, v = v, 1 - u
+    return [round(u, 4), round(v, 4)]
+
+
+def _parse_exiftool(d: dict) -> dict:
+    return {
+        "camera": str(d.get("Model", "")),
+        "lens": str(d.get("LensModel", "")),
+        "focalLength": str(d.get("FocalLength", "")),
+        "aperture": str(d.get("FNumber", "")),
+        "shutterSpeed": str(
+            d.get("ShutterSpeed", d.get("ExposureTime", ""))
+        ),
+        "iso": str(d.get("ISO", "")),
+        "filmSimulation": str(d.get("FilmMode", "")),
+        "whiteBalance": str(d.get("WhiteBalance", "")),
+        "exposureComp": str(d.get("ExposureCompensation", "")),
+        "date": str(d.get("DateTimeOriginal", "")),
+        "resolution": str(d.get("ImageSize", "")),
+        "meteringMode": str(d.get("MeteringMode", "")),
+        "focusMode": str(d.get("FocusMode", "")),
+        "focusWarning": str(d.get("FocusWarning", "")),
+        "afPoint": _af_point(d),
+        "dynamicRange": str(d.get("DynamicRange", "")),
+        "gpsLatitude": _parse_exiftool_gps(d.get("GPSLatitude", ""), d.get("GPSLatitudeRef", "")),
+        "gpsLongitude": _parse_exiftool_gps(d.get("GPSLongitude", ""), d.get("GPSLongitudeRef", "")),
+    }
+
+
 def _exif_exiftool(path: Path) -> dict:
     try:
         r = subprocess.run(
@@ -281,29 +592,29 @@ def _exif_exiftool(path: Path) -> dict:
         )
         if r.returncode != 0:
             return {}
-        d = json.loads(r.stdout)[0]
-        return {
-            "camera": str(d.get("Model", "")),
-            "lens": str(d.get("LensModel", "")),
-            "focalLength": str(d.get("FocalLength", "")),
-            "aperture": str(d.get("FNumber", "")),
-            "shutterSpeed": str(
-                d.get("ShutterSpeed", d.get("ExposureTime", ""))
-            ),
-            "iso": str(d.get("ISO", "")),
-            "filmSimulation": str(d.get("FilmMode", "")),
-            "whiteBalance": str(d.get("WhiteBalance", "")),
-            "exposureComp": str(d.get("ExposureCompensation", "")),
-            "date": str(d.get("DateTimeOriginal", "")),
-            "resolution": str(d.get("ImageSize", "")),
-            "meteringMode": str(d.get("MeteringMode", "")),
-            "focusMode": str(d.get("FocusMode", "")),
-            "dynamicRange": str(d.get("DynamicRange", "")),
-            "gpsLatitude": _parse_exiftool_gps(d.get("GPSLatitude", ""), d.get("GPSLatitudeRef", "")),
-            "gpsLongitude": _parse_exiftool_gps(d.get("GPSLongitude", ""), d.get("GPSLongitudeRef", "")),
-        }
+        return _parse_exiftool(json.loads(r.stdout)[0])
     except Exception:
         return {}
+
+
+def _prefetch_exif(batch_size: int = 50) -> None:
+    """Read EXIF for all photos in a few batched exiftool calls (one process per call is slow)."""
+    items = [(g.id, g.jpeg_path or g.raw_path) for g in photos]
+    for i in range(0, len(items), batch_size):
+        chunk = [(pid, path) for pid, path in items[i:i + batch_size] if pid not in exif_cache]
+        if not chunk:
+            continue
+        try:
+            r = subprocess.run(
+                [EXIFTOOL_CMD, "-json", "-c", "%.6f", *(str(p) for _, p in chunk)],
+                capture_output=True, text=True, timeout=120,
+            )
+            records = {d.get("SourceFile"): d for d in json.loads(r.stdout or "[]")}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        for pid, path in chunk:
+            if str(path) in records:
+                exif_cache.setdefault(pid, _parse_exiftool(records[str(path)]))
 
 
 def _gps_dms_to_decimal(dms, ref: str) -> float | None:
@@ -401,12 +712,95 @@ def _exif_pillow(path: Path) -> dict:
             "resolution": f'{tags.get("ImageWidth", tags.get("PixelXDimension", ""))}x{tags.get("ImageLength", tags.get("PixelYDimension", ""))}',
             "meteringMode": str(tags.get("MeteringMode", "")),
             "focusMode": "",
+            "focusWarning": "",
+            "afPoint": None,
             "dynamicRange": "",
             "gpsLatitude": gps_lat,
             "gpsLongitude": gps_lon,
         }
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Favourites → metadata
+# ---------------------------------------------------------------------------
+def _write_favorite(path: Path, sidecar: bool = False) -> bool:
+    """Add the favourite keyword (which Apple Photos imports) to a file.
+
+    With sidecar=True, `path` is a RAW and the keyword goes to an XMP sidecar next to it
+    (the convention Lightroom, Capture One and darktable read).
+    """
+    target = path.with_suffix(".xmp") if sidecar else path
+    # Remove-then-add, so applying twice doesn't duplicate the keyword
+    args = [EXIFTOOL_CMD, "-q", "-P",
+            f"-XMP-dc:Subject-={FAVORITE_KEYWORD}", f"-XMP-dc:Subject+={FAVORITE_KEYWORD}"]
+    if target.suffix.lower() in {".jpg", ".jpeg"}:
+        args += [f"-IPTC:Keywords-={FAVORITE_KEYWORD}", f"-IPTC:Keywords+={FAVORITE_KEYWORD}"]
+    if sidecar and not target.exists():
+        args += ["-o", str(target), str(path)]   # create the sidecar from the RAW's metadata
+    else:
+        args += ["-overwrite_original", str(target)]
+    try:
+        subprocess.run(args, capture_output=True, check=True, timeout=30)
+        return True
+    except Exception as e:
+        print(f"Warning: failed to tag {target} as favourite: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Apple Photos import (macOS)
+# ---------------------------------------------------------------------------
+# argv: favourite flag ("1"/"0"), album name ("" = none), file paths...
+PHOTOS_IMPORT_SCRIPT = """
+on run argv
+    set favFlag to item 1 of argv
+    set albumName to item 2 of argv
+    set fileList to {}
+    repeat with i from 3 to count of argv
+        set end of fileList to (POSIX file (item i of argv)) as alias
+    end repeat
+    tell application "Photos"
+        with timeout of 3600 seconds
+            if albumName is "" then
+                set newItems to import fileList skip check duplicates true
+            else
+                if not (exists album albumName) then make new album named albumName
+                set newItems to import fileList into album albumName skip check duplicates true
+            end if
+            if newItems is missing value then return 0
+            if favFlag is "1" then
+                repeat with m in newItems
+                    set favorite of m to true
+                end repeat
+            end if
+            return count of newItems
+        end timeout
+    end tell
+end run
+"""
+
+
+def _import_to_photos(paths: list, album: str, favorite: bool, batch_size: int = 100) -> tuple[int, str | None]:
+    """Import files into Apple Photos. Returns (number of files sent successfully, error or None)."""
+    script_args = []
+    for line in PHOTOS_IMPORT_SCRIPT.strip().splitlines():
+        script_args += ["-e", line]
+    done = 0
+    for i in range(0, len(paths), batch_size):
+        chunk = paths[i:i + batch_size]
+        try:
+            subprocess.run(
+                ["osascript", *script_args, "1" if favorite else "0", album, *(str(p) for p in chunk)],
+                capture_output=True, text=True, check=True, timeout=3700,
+            )
+        except subprocess.CalledProcessError as e:
+            return done, (e.stderr or str(e)).strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            return done, str(e)
+        done += len(chunk)
+    return done, None
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +813,7 @@ def index():
 
 @app.route("/api/capabilities")
 def api_capabilities():
-    return jsonify({"exiftool": HAS_EXIFTOOL, "rawpy": HAS_RAWPY, "heif": HAS_HEIF})
+    return jsonify({"exiftool": HAS_EXIFTOOL, "rawpy": HAS_RAWPY, "heif": HAS_HEIF, "photos": HAS_PHOTOS})
 
 
 @app.route("/api/photos")
@@ -430,25 +824,48 @@ def api_photos():
 @app.route("/api/image/<photo_id>/<source>")
 def api_image(photo_id, source):
     group = photo_map.get(photo_id)
-    if not group:
+    if not group or source not in ("jpeg", "raw"):
         abort(404)
+    data = _source_image(group, source)
+    if not data:
+        abort(404)
+    if isinstance(data, Path):
+        return send_file(data, mimetype="image/jpeg")
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
 
-    data = None
-    if source == "jpeg" and group.jpeg_path:
-        data = _jpeg_bytes_for(group.jpeg_path)
-    elif source == "raw" and group.raw_path:
-        # Develop RAW with neutral settings (no film sim)
-        data = _develop_raw(group.raw_path)
-    elif source == "jpeg" and group.raw_path:
-        # No JPEG file — fall back to embedded RAF thumbnail
-        data = _extract_raf_thumb(group.raw_path)
-    elif source == "raw" and group.jpeg_path:
-        # No RAW file — fall back to JPEG
-        data = _jpeg_bytes_for(group.jpeg_path)
 
+@app.route("/api/peaking/<photo_id>/<source>")
+def api_peaking(photo_id, source):
+    group = photo_map.get(photo_id)
+    level = request.args.get("level", 2, type=int)
+    if not group or source not in ("jpeg", "raw") or level not in PEAKING_THRESHOLDS:
+        abort(404)
+    data = _peaking_image(group, source, level)
     if not data:
         abort(404)
     return send_file(io.BytesIO(data), mimetype="image/jpeg")
+
+
+@app.route("/api/clipping/<photo_id>/<source>")
+def api_clipping(photo_id, source):
+    group = photo_map.get(photo_id)
+    if not group or source not in ("jpeg", "raw"):
+        abort(404)
+    data = _clipping_image(group, source)
+    if not data:
+        abort(404)
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
+
+
+@app.route("/api/exposure/<photo_id>")
+def api_exposure(photo_id):
+    group = photo_map.get(photo_id)
+    if not group:
+        abort(404)
+    jpeg = _jpeg_clip_stats(group)
+    raw_result = _raw_clipping(group.raw_path) if group.raw_path else None
+    raw = raw_result[0] if raw_result else None
+    return jsonify({"jpeg": jpeg, "raw": raw, "verdict": _headroom_verdict(jpeg, raw)})
 
 
 @app.route("/api/thumb/<photo_id>")
@@ -456,10 +873,9 @@ def api_thumb(photo_id):
     group = photo_map.get(photo_id)
     if not group:
         abort(404)
-    data = _best_image(group)
-    if not data:
+    thumb = _make_thumbnail(group)
+    if not thumb:
         abort(404)
-    thumb = _make_thumbnail(data)
     return send_file(io.BytesIO(thumb), mimetype="image/jpeg")
 
 
@@ -478,15 +894,32 @@ def api_exif(photo_id):
 
 @app.route("/api/decide", methods=["POST"])
 def api_decide():
-    body = request.json
+    body = request.get_json(silent=True) or {}
     photo_id = body.get("id")
     decision = body.get("decision")  # "delete" | "keep_jpeg" | "keep_both" | None
     if photo_id not in photo_map:
         abort(404)
     if decision is None:
         decisions.pop(photo_id, None)
-    else:
+    elif decision in DECISIONS:
         decisions[photo_id] = decision
+    else:
+        return jsonify({"error": f"Unknown decision {decision!r}"}), 400
+    save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/favorite", methods=["POST"])
+def api_favorite():
+    body = request.get_json(silent=True) or {}
+    photo_id = body.get("id")
+    if photo_id not in photo_map:
+        abort(404)
+    if body.get("favorite"):
+        favorites.add(photo_id)
+    else:
+        favorites.discard(photo_id)
+    save_state()
     return jsonify({"ok": True})
 
 
@@ -503,18 +936,32 @@ def api_summary():
             keep_both += 1
         else:
             undecided += 1
+    favs = sum(1 for p in photos if p.id in favorites and decisions.get(p.id) != "delete")
+    to_import = _photos_to_import()
     return jsonify({
         "delete": delete,
         "keepJpeg": keep_jpeg,
         "keepBoth": keep_both,
         "undecided": undecided,
+        "favorites": favs,
+        "toImport": len(to_import),
+        "favoritesToImport": sum(1 for p in to_import if p.id in favorites),
+        "photosAlbum": photos_album,
         "total": len(photos),
+        "exiftool": HAS_EXIFTOOL,
     })
+
+
+def _photos_to_import() -> list:
+    """Kept photos whose JPEG/HEIF hasn't been imported into Apple Photos yet."""
+    return [p for p in photos
+            if decisions.get(p.id) in ("keep_jpeg", "keep_both")
+            and p.jpeg_path and p.id not in imported]
 
 
 @app.route("/api/geocode", methods=["POST"])
 def api_geocode():
-    query = (request.json or {}).get("query", "").strip()
+    query = (request.get_json(silent=True) or {}).get("query", "").strip()
     if not query:
         return jsonify({"error": "Empty query"}), 400
     try:
@@ -536,12 +983,13 @@ def api_geocode():
 def api_geotag():
     if not HAS_EXIFTOOL:
         return jsonify({"error": "exiftool is required for writing GPS data"}), 500
-    body = request.json or {}
+    body = request.get_json(silent=True) or {}
     photo_id = body.get("id")
-    lat = body.get("lat")
-    lon = body.get("lon")
-    if not photo_id or lat is None or lon is None:
-        return jsonify({"error": "Missing id, lat, or lon"}), 400
+    try:
+        lat = float(body["lat"])
+        lon = float(body["lon"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "Missing or invalid id, lat, or lon"}), 400
     group = photo_map.get(photo_id)
     if not group:
         abort(404)
@@ -569,45 +1017,120 @@ def api_geotag():
             print(f"Warning: failed to geotag {path}: {e}")
 
     # Invalidate EXIF cache
-    cache.pop(f"exif:{photo_id}", None)
+    exif_cache.pop(photo_id, None)
 
     return jsonify({"ok": True, "tagged": tagged})
 
 
+def _move(src: Path, dest_dir: Path, rename_on_conflict: bool) -> Path | None:
+    """Move src into dest_dir without ever overwriting an existing file.
+
+    On a name clash, either pick a free name (stem_1.ext, …) or return None and leave src alone.
+    """
+    dest = dest_dir / src.name
+    if dest.exists():
+        if not rename_on_conflict:
+            return None
+        n = 1
+        while dest.exists():
+            dest = dest_dir / f"{src.stem}_{n}{src.suffix}"
+            n += 1
+    shutil.move(str(src), str(dest))
+    return dest
+
+
 @app.route("/api/apply", methods=["POST"])
 def api_apply():
+    if not apply_lock.acquire(blocking=False):
+        return jsonify({"error": "Apply is already running"}), 409
+    try:
+        return jsonify(_apply((request.get_json(silent=True) or {})))
+    finally:
+        apply_lock.release()
+
+
+def _apply(options: dict) -> dict:
     trash = source_dir / TRASH_DIR_NAME
     trash.mkdir(exist_ok=True)
-    trashed = archived = 0
+    trashed = archived = tagged = 0
+    conflicts = []
+    tag_errors = []
 
     for p in photos:
         d = decisions.get(p.id)
+        fav = p.id in favorites
         if d == "delete":
             # Move all files (raw, jpeg, audio) to trash
             for path in [p.raw_path, p.jpeg_path, p.audio_path]:
                 if path and path.exists():
-                    shutil.move(str(path), str(trash / path.name))
+                    _move(path, trash, rename_on_conflict=True)
                     trashed += 1
-        elif d == "keep_jpeg":
+            continue
+
+        if fav and HAS_EXIFTOOL and p.jpeg_path and p.jpeg_path.exists():
+            if _write_favorite(p.jpeg_path):
+                tagged += 1
+            else:
+                tag_errors.append(p.jpeg_path.name)
+
+        if d == "keep_jpeg":
             # Discard RAW, keep JPEG + WAV in import folder
             if p.raw_path and p.raw_path.exists():
-                shutil.move(str(p.raw_path), str(trash / p.raw_path.name))
+                _move(p.raw_path, trash, rename_on_conflict=True)
                 trashed += 1
         elif d == "keep_both":
-            # Move RAW to archive, keep JPEG + WAV in import folder
+            # Move RAW to archive, keep JPEG + WAV in import folder.
+            # Never overwrite: Fuji file numbers repeat after DSCF9999 or across bodies.
             if archive_dir and p.raw_path and p.raw_path.exists():
-                shutil.move(str(p.raw_path), str(archive_dir / p.raw_path.name))
+                dest = _move(p.raw_path, archive_dir, rename_on_conflict=False)
+                if dest is None:
+                    existing = archive_dir / p.raw_path.name
+                    if filecmp.cmp(p.raw_path, existing, shallow=False):
+                        # Byte-identical copy already archived (e.g. a re-run): drop this one
+                        _move(p.raw_path, trash, rename_on_conflict=True)
+                        archived += 1
+                    else:
+                        conflicts.append(p.raw_path.name)
+                    continue
                 archived += 1
+                if fav and HAS_EXIFTOOL and not _write_favorite(dest, sidecar=True):
+                    tag_errors.append(dest.with_suffix(".xmp").name)
+
+    # Pick up the new state of the folder; thumbnails/EXIF of remaining files stay valid
+    scan(source_dir)
+
+    # Import kept JPEG/HEIFs into Apple Photos: favourites in their own batch so they can be
+    # flagged as Favorites right after import
+    imported_count = 0
+    photos_error = None
+    if options.get("importToPhotos") and HAS_PHOTOS:
+        album = str(options.get("album", photos_album)).strip()
+        to_import = _photos_to_import()
+        for as_favorite in (True, False):
+            batch = [p for p in to_import if (p.id in favorites) == as_favorite]
+            if not batch:
+                continue
+            done, photos_error = _import_to_photos([p.jpeg_path for p in batch], album, as_favorite)
+            imported.update(p.id for p in batch[:done])
+            imported_count += done
+            if photos_error:
+                break
+    save_state()
 
     result = {
         "ok": True,
         "trashed": trashed,
         "archived": archived,
+        "tagged": tagged,
+        "imported": imported_count,
+        "photosError": photos_error,
+        "conflicts": conflicts,
+        "tagErrors": tag_errors,
         "trashDir": str(trash),
     }
     if archive_dir:
         result["archiveDir"] = str(archive_dir)
-    return jsonify(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +1142,10 @@ def main():
     parser.add_argument("--archive", type=Path, default=None,
                         help="Archive folder for kept RAWs (default: sibling 'archive' folder)")
     parser.add_argument("--port", type=int, default=8080, help="Server port (default 8080)")
+    parser.add_argument("--cache-mb", type=int, default=1024,
+                        help="Memory budget for converted previews in MB (default 1024)")
+    parser.add_argument("--photos-album", default="",
+                        help="Default Apple Photos album for imports on Apply (can be changed in the Apply dialog)")
     parser.add_argument("--no-browser", action="store_true", help="Don't open browser automatically")
     args = parser.parse_args()
 
@@ -626,7 +1153,8 @@ def main():
         print(f"Error: {args.directory} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    global archive_dir
+    global archive_dir, photos_album
+    photos_album = args.photos_album
     if args.archive:
         archive_dir = args.archive.resolve()
     else:
@@ -635,12 +1163,15 @@ def main():
 
     archive_dir.mkdir(parents=True, exist_ok=True)
     print(f"Archive folder: {archive_dir}")
+    image_cache.max_bytes = args.cache_mb * 1024 * 1024
 
     scan(args.directory.resolve())
 
     if not photos:
         print("No supported photos found. Exiting.")
         sys.exit(0)
+
+    load_state()
 
     caps = []
     if HAS_RAWPY:
@@ -649,6 +1180,7 @@ def main():
         caps.append("pillow-heif")
     if HAS_EXIFTOOL:
         caps.append("exiftool")
+        threading.Thread(target=_prefetch_exif, daemon=True).start()
     print(f"Capabilities: {', '.join(caps) or 'basic only'}")
 
     if not args.no_browser:
