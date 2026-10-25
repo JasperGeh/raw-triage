@@ -1,3 +1,5 @@
 __pycache__/
 .venv/
 .raw-triage.json
+.DS_Store
+launch.json
