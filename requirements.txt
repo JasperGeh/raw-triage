@@ -3,3 +3,4 @@ rawpy>=0.21
 Pillow>=10.0
 pillow-heif>=0.16
 geopy>=2.4
+numpy>=1.24
