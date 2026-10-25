@@ -29,9 +29,9 @@
   .badge-raw { background: rgba(229,69,69,0.2); color: var(--red); font-weight: 500; }
   .badge-lossy { background: rgba(74,158,237,0.2); color: var(--blue); font-weight: 500; }
   .badge-pair { background: rgba(69,184,90,0.2); color: var(--green); font-weight: 500; }
-  .stars { font-size: 16px; letter-spacing: 1px; color: var(--bg3); cursor: pointer; margin-left: 4px; }
-  .stars span:hover { color: var(--fg2); }
-  .stars span.on { color: var(--yellow); }
+  .fav { font-size: 18px; color: var(--bg3); cursor: pointer; margin-left: 4px; }
+  .fav:hover { color: var(--fg2); }
+  .fav.on { color: var(--yellow); }
 
   /* Main area */
   .main { flex: 1; display: flex; position: relative; overflow: hidden; min-height: 0; }
@@ -65,6 +65,10 @@
   .geotag-confirm .geo-actions button { padding: 3px 10px; border-radius: 4px; border: none; font-size: 11px; font-weight: 600; cursor: pointer; }
   .geo-confirm-btn { background: var(--green); color: #fff; }
   .geo-cancel-btn { background: var(--bg3); color: var(--fg2); }
+  .exposure-verdict { margin-top: 8px; padding: 6px 8px; border-radius: 4px; font-size: 12px; line-height: 1.4; background: var(--bg3); }
+  .exposure-verdict.raw { color: var(--green); }
+  .exposure-verdict.lost { color: var(--red); }
+  .exposure-verdict.ok { color: var(--fg2); }
 
   /* Bottom bar */
   .bottombar { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: var(--bg2); border-top: 1px solid var(--bg3); flex-shrink: 0; gap: 12px; }
@@ -101,7 +105,7 @@
   .strip-item.decided-keep_both { border-color: var(--green); opacity: 0.8; }
   .strip-item img { width: 100%; height: 100%; object-fit: cover; }
   .strip-item .strip-placeholder { width: 100%; height: 100%; background: var(--bg3); }
-  .strip-item[data-rating]:not([data-rating="0"])::after { content: attr(data-rating) "\2605"; position: absolute; right: 2px; bottom: 0; font-size: 9px; font-weight: 700; color: var(--yellow); text-shadow: 0 0 2px #000, 0 0 2px #000; }
+  .strip-item[data-fav="1"]::after { content: "\2605"; position: absolute; right: 2px; bottom: 0; font-size: 10px; color: var(--yellow); text-shadow: 0 0 2px #000, 0 0 2px #000; }
 
   /* Modal */
   .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
@@ -114,6 +118,11 @@
   .modal .modal-actions button { padding: 8px 20px; border-radius: var(--radius); border: none; cursor: pointer; font-size: 14px; font-weight: 600; }
   .modal .btn-cancel { background: var(--bg3); color: var(--fg); }
   .modal .btn-confirm { background: var(--blue); color: #fff; }
+  .modal .btn-confirm:disabled { opacity: 0.6; cursor: default; }
+  .photos-import { margin-top: 14px; font-size: 13px; }
+  .photos-import label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .photos-import input[type=text] { margin-top: 8px; width: 100%; background: var(--bg); border: 1px solid var(--bg3); color: var(--fg); padding: 6px 8px; border-radius: 4px; font-size: 13px; font-family: inherit; outline: none; }
+  .photos-import input[type=text]:focus { border-color: var(--blue); }
 
   /* Circular progress */
   .progress-ring { position: relative; width: 36px; height: 36px; flex-shrink: 0; }
@@ -139,7 +148,7 @@
     <span class="filename" id="filename"></span>
     <span class="badge" id="pairBadge"></span>
     <span class="badge" id="decisionBadge"></span>
-    <span class="stars" id="stars" title="Rating (Shift+1…5, F = favourite, 0 = clear)"></span>
+    <span class="fav" id="favStar" onclick="toggleFavorite()" title="Favourite (F)">&#9734;</span>
   </div>
   <div class="topbar-right">
     <div class="progress-ring" id="progressRing" title="Triage progress">
@@ -160,6 +169,8 @@
   <div class="exif-panel" id="exifPanel">
     <h3>EXIF Info</h3>
     <div id="exifContent"></div>
+    <h3 style="margin-top:20px">Exposure</h3>
+    <div id="exposureContent"></div>
   </div>
 </div>
 
@@ -174,6 +185,7 @@
     <button class="act-btn btn-audio" id="audioBtn" onclick="toggleAudio()" style="display:none"><span class="ico">&#9654;</span> Memo <kbd>M</kbd></button>
     <button class="act-btn btn-toggle" id="afToggle" onclick="toggleAf()" title="Show the camera's AF point (Fujifilm, needs exiftool)">AF Point <kbd>A</kbd></button>
     <button class="act-btn btn-toggle" id="peakToggle" onclick="togglePeaking()" title="Focus peaking (Shift+P: sensitivity)">Peaking <kbd>P</kbd></button>
+    <button class="act-btn btn-toggle" id="clipToggle" onclick="toggleClipping()" title="Clipping warnings: red = blown, orange = some channels clipped, blue = crushed shadows. On the RAW preview: red = clipped on the sensor">Clipping <kbd>C</kbd></button>
     <button class="act-btn btn-toggle" id="sourceToggle" onclick="toggleSource()">RAW Preview <kbd>T</kbd></button>
   </div>
 </div>
@@ -185,10 +197,14 @@
   <div class="modal">
     <h2>Apply Triage Decisions</h2>
     <div id="applySummary"></div>
+    <div class="photos-import" id="photosImport" style="display:none">
+      <label><input type="checkbox" id="photosImportCheck" checked> <span id="photosImportLabel"></span></label>
+      <input type="text" id="photosAlbum" placeholder="Album (optional)" spellcheck="false">
+    </div>
     <p style="font-size:12px;color:var(--fg2);margin-top:12px;">Deleted files go to <code>_triage_trash/</code>. Archived RAWs are moved to the archive folder. JPEG/HEIFs and WAVs stay in the import folder.</p>
     <div class="modal-actions">
       <button class="btn-cancel" onclick="hideApply()">Cancel</button>
-      <button class="btn-confirm" onclick="applyDecisions()">Confirm</button>
+      <button class="btn-confirm" id="applyConfirm" onclick="applyDecisions()">Confirm</button>
     </div>
   </div>
 </div>
@@ -199,7 +215,7 @@ let idx = 0;
 let viewSource = 'jpeg';  // 'jpeg' or 'raw'
 let zoomed = false;
 let exifVisible = true;
-let peaking = false;
+let overlay = null;       // null | 'peaking' | 'clipping'
 let peakLevel = 2;        // 1 = low, 2 = medium, 3 = high sensitivity
 let showAf = true;
 let currentExif = null;   // EXIF of the photo on screen (for the AF point)
@@ -248,7 +264,7 @@ function showPhoto(i) {
 
   // Decision badge
   updateDecisionBadge(p);
-  renderStars(p);
+  renderFavorite(p);
 
   // Action button highlights
   document.getElementById('btnDelete').classList.toggle('active', p.decision === 'delete');
@@ -281,8 +297,9 @@ function showPhoto(i) {
   // Load image
   loadImage(p);
 
-  // Load EXIF
+  // Load EXIF and clipping stats
   loadExif(p.id);
+  loadExposure(p.id);
 
   // Update filmstrip
   updateFilmstripCurrent();
@@ -305,9 +322,9 @@ function effectiveSource(p) {
 }
 
 function viewUrl(p, src) {
-  return peaking
-    ? `/api/peaking/${enc(p.id)}/${src}?level=${peakLevel}`
-    : `/api/image/${enc(p.id)}/${src}`;
+  if (overlay === 'peaking') return `/api/peaking/${enc(p.id)}/${src}?level=${peakLevel}`;
+  if (overlay === 'clipping') return `/api/clipping/${enc(p.id)}/${src}`;
+  return `/api/image/${enc(p.id)}/${src}`;
 }
 
 function loadImage(p) {
@@ -318,7 +335,8 @@ function loadImage(p) {
 
   // Toggle button state
   document.getElementById('sourceToggle').classList.toggle('active', src === 'raw');
-  document.getElementById('peakToggle').classList.toggle('active', peaking);
+  document.getElementById('peakToggle').classList.toggle('active', overlay === 'peaking');
+  document.getElementById('clipToggle').classList.toggle('active', overlay === 'clipping');
 
   wantedUrl = url;
   if (img.getAttribute('src') === url) return;
@@ -339,7 +357,8 @@ function renderSourceLabel() {
   const parts = [];
   if (p.hasRaw && p.hasJpeg) parts.push(src === 'raw' ? 'RAW Developed (½ size)' : (p.jpegExt || 'JPEG').replace(/^\./, ''));
   else if (p.hasRaw) parts.push(src === 'raw' ? 'RAW Developed (½ size)' : 'Embedded Thumbnail');
-  if (peaking) parts.push(`Peaking (${PEAK_LABELS[peakLevel]})`);
+  if (overlay === 'peaking') parts.push(`Peaking (${PEAK_LABELS[peakLevel]})`);
+  if (overlay === 'clipping') parts.push(src === 'raw' ? 'Sensor clipping' : 'Clipping');
   if (zoomed) parts.push('100%');
   label.textContent = parts.join(' · ');
   label.style.display = parts.length ? '' : 'none';
@@ -415,6 +434,30 @@ async function loadExif(id) {
   }
 }
 
+async function loadExposure(id) {
+  const container = document.getElementById('exposureContent');
+  container.innerHTML = '<div style="color:var(--fg2)">Analysing...</div>';
+  try {
+    const data = await (await fetch(`/api/exposure/${enc(id)}`)).json();
+    if (photos[idx].id !== id) return;  // user has moved on
+    const row = (l, v, title = '') =>
+      `<div class="exif-row" title="${esc(title)}"><span class="exif-label">${l}</span><span class="exif-value">${esc(v)}</span></div>`;
+    let html = '';
+    if (data.jpeg) {
+      html += row('JPEG highlights', `${data.jpeg.highlights}% clipped`, `${data.jpeg.blown}% fully blown (all channels)`);
+      html += row('JPEG shadows', `${data.jpeg.shadows}% crushed`);
+    }
+    if (data.raw) {
+      html += row('RAW clipped', `${data.raw.clipped}%`, 'Clipped on the sensor: not recoverable');
+      html += row('RAW headroom', `${data.raw.headroomEv} EV`, 'How far the brightest 0.1% of the RAW sits below sensor saturation');
+    }
+    if (data.verdict) html += `<div class="exposure-verdict ${data.verdict.level}">${esc(data.verdict.text)}</div>`;
+    container.innerHTML = html || '<div style="color:var(--fg2)">No data</div>';
+  } catch {
+    container.innerHTML = '<div style="color:var(--fg2)">Could not analyse</div>';
+  }
+}
+
 async function decide(decision) {
   const i = idx;
   const p = photos[i];
@@ -457,27 +500,23 @@ async function undo() {
   });
 }
 
-async function setRating(stars) {
+async function toggleFavorite() {
   const p = photos[idx];
-  p.rating = stars;
-  renderStars(p);
+  p.favorite = !p.favorite;
+  renderFavorite(p);
   const item = document.querySelector(`.strip-item[data-idx="${idx}"]`);
-  if (item) item.dataset.rating = stars;
-  await fetch('/api/rate', {
+  if (item) item.dataset.fav = p.favorite ? 1 : 0;
+  await fetch('/api/favorite', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: p.id, rating: stars }),
+    body: JSON.stringify({ id: p.id, favorite: p.favorite }),
   });
 }
 
-function toggleFavorite() {
-  setRating(photos[idx].rating === 5 ? 0 : 5);
-}
-
-function renderStars(p) {
-  document.getElementById('stars').innerHTML = [1, 2, 3, 4, 5].map(n =>
-    `<span class="${n <= (p.rating || 0) ? 'on' : ''}" onclick="setRating(${n === p.rating ? 0 : n})">${n <= (p.rating || 0) ? '&#9733;' : '&#9734;'}</span>`
-  ).join('');
+function renderFavorite(p) {
+  const el = document.getElementById('favStar');
+  el.innerHTML = p.favorite ? '&#9733;' : '&#9734;';
+  el.classList.toggle('on', !!p.favorite);
 }
 
 // Refresh decision-dependent UI for photo i (filmstrip always, top/bottom bar if on screen)
@@ -602,17 +641,24 @@ function toggleSource() {
   updateSourceToggleText(p);
 }
 
-// Focus peaking (keeps the zoom position: the peaking image has the same size)
-function togglePeaking() {
-  peaking = !peaking;
+// Overlays (keep the zoom position: overlay images have the same size as the original)
+function setOverlay(mode) {
+  overlay = mode;
   loadImage(photos[idx]);
   preloadAt(idx + 1);
 }
 
+function togglePeaking() {
+  setOverlay(overlay === 'peaking' ? null : 'peaking');
+}
+
 function cyclePeakLevel() {
   peakLevel = peakLevel % 3 + 1;
-  if (!peaking) peaking = true;
-  loadImage(photos[idx]);
+  setOverlay('peaking');
+}
+
+function toggleClipping() {
+  setOverlay(overlay === 'clipping' ? null : 'clipping');
 }
 
 function toggleAf() {
@@ -793,7 +839,7 @@ window.addEventListener('resize', positionAfMarker);
 function buildFilmstrip() {
   const strip = document.getElementById('filmstrip');
   strip.innerHTML = photos.map((p, i) =>
-    `<div class="strip-item${p.decision ? ` decided-${p.decision}` : ''}" data-idx="${i}" data-rating="${p.rating || 0}" onclick="showPhoto(${i})"><div class="strip-placeholder"></div></div>`
+    `<div class="strip-item${p.decision ? ` decided-${p.decision}` : ''}" data-idx="${i}" data-fav="${p.favorite ? 1 : 0}" onclick="showPhoto(${i})"><div class="strip-placeholder"></div></div>`
   ).join('');
 
   // Lazy-load thumbnails
@@ -826,15 +872,21 @@ function updateFilmstripCurrent() {
 async function showApply() {
   const res = await fetch('/api/summary');
   const s = await res.json();
-  let ratedNote = '';
-  if (s.rated > 0 && !s.exiftool) ratedNote = ' <span style="color:var(--red)">(needs exiftool — will be skipped)</span>';
+  let favNote = '';
+  if (s.favorites > 0 && !s.exiftool) favNote = ' <span style="color:var(--red)">(needs exiftool — will be skipped)</span>';
   document.getElementById('applySummary').innerHTML = `
     <div class="summary-row"><span style="color:var(--red)">Delete all files</span><span class="summary-count">${s.delete}</span></div>
     <div class="summary-row"><span style="color:var(--yellow)">Keep JPEG/HEIF only (trash RAW)</span><span class="summary-count">${s.keepJpeg}</span></div>
     <div class="summary-row"><span style="color:var(--green)">Keep both (archive RAW)</span><span class="summary-count">${s.keepBoth}</span></div>
     <div class="summary-row"><span style="color:var(--fg2)">Undecided (no action)</span><span class="summary-count">${s.undecided}</span></div>
-    <div class="summary-row"><span style="color:var(--yellow)">&#9733; Write ratings to metadata${ratedNote}</span><span class="summary-count">${s.rated}</span></div>
+    <div class="summary-row"><span style="color:var(--yellow)">&#9733; Tag favourites${favNote}</span><span class="summary-count">${s.favorites}</span></div>
   `;
+  const pi = document.getElementById('photosImport');
+  pi.style.display = capabilities.photos && s.toImport > 0 ? '' : 'none';
+  document.getElementById('photosImportLabel').textContent =
+    `Import ${s.toImport} kept JPEG/HEIF(s) into Apple Photos` + (s.favoritesToImport ? ` (${s.favoritesToImport} as Favorites)` : '');
+  const album = document.getElementById('photosAlbum');
+  if (!album.value) album.value = s.photosAlbum || '';
   document.getElementById('applyModal').classList.add('visible');
 }
 
@@ -843,14 +895,32 @@ function hideApply() {
 }
 
 async function applyDecisions() {
-  const res = await fetch('/api/apply', { method: 'POST' });
-  const r = await res.json();
+  const btn = document.getElementById('applyConfirm');
+  const importToPhotos = document.getElementById('photosImport').style.display !== 'none'
+    && document.getElementById('photosImportCheck').checked;
+  btn.disabled = true;
+  btn.textContent = importToPhotos ? 'Applying & importing…' : 'Applying…';
+  let r;
+  try {
+    const res = await fetch('/api/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ importToPhotos, album: document.getElementById('photosAlbum').value }),
+    });
+    r = await res.json();
+    if (!res.ok) { alert(r.error || 'Apply failed'); return; }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Confirm';
+  }
   hideApply();
   let msg = `Done! Trashed ${r.trashed} file(s).`;
   if (r.archived > 0) msg += ` Archived ${r.archived} RAW(s) to ${r.archiveDir}.`;
-  if (r.rated > 0) msg += ` Wrote ratings to ${r.rated} JPEG/HEIF file(s).`;
-  if (r.conflicts.length) msg += `\n\nNot archived — a file with the same name already exists in the archive (left in place):\n${r.conflicts.join(', ')}`;
-  if (r.ratingErrors.length) msg += `\n\nCould not write ratings to: ${r.ratingErrors.join(', ')}`;
+  if (r.tagged > 0) msg += ` Tagged ${r.tagged} favourite(s).`;
+  if (r.imported > 0) msg += ` Imported ${r.imported} photo(s) into Apple Photos.`;
+  if (r.photosError) msg += `\n\nApple Photos import stopped: ${r.photosError}\n(If macOS asked for permission to control Photos, allow it and hit Apply again: already-imported photos are skipped.)`;
+  if (r.conflicts.length) msg += `\n\nNot archived: a different file with the same name already exists in the archive (left in place):\n${r.conflicts.join(', ')}`;
+  if (r.tagErrors.length) msg += `\n\nCould not tag as favourite: ${r.tagErrors.join(', ')}`;
   alert(msg);
 
   // Show what is left in the folder
@@ -879,10 +949,6 @@ document.addEventListener('keydown', (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;  // leave browser shortcuts (Cmd+1, Cmd+R…) alone
   if (!photos.length) return;
 
-  // Shift+1…5 sets the star rating (by physical key, so it works on any keyboard layout)
-  const digit = /^Digit([0-5])$/.exec(e.code);
-  if (e.shiftKey && digit) { e.preventDefault(); setRating(+digit[1]); return; }
-
   switch (e.key) {
     case 'ArrowLeft':  e.preventDefault(); navigate(-1); break;
     case 'ArrowRight': e.preventDefault(); navigate(1); break;
@@ -891,9 +957,9 @@ document.addEventListener('keydown', (e) => {
     case '2':          decide('keep_jpeg'); break;
     case '3':          decide('keep_both'); break;
     case '4':          undo(); break;
-    case '0':          setRating(0); break;
     case 'f': case 'F': toggleFavorite(); break;
     case 'p': case 'P': e.shiftKey ? cyclePeakLevel() : togglePeaking(); break;
+    case 'c': case 'C': toggleClipping(); break;
     case 'a': case 'A': toggleAf(); break;
     case 't': case 'T': toggleSource(); break;
     case 'i': case 'I': toggleExif(); break;
